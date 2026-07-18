@@ -1,4 +1,4 @@
-# MC8-Pro-Ableton-Control-Script
+# Morningstar MC8-Pro-Ableton-Control-Script
 A barebones script to enable basic transport controls without on-device state management or additional translation of MIDI sent to the device.
 
 ## Setup
