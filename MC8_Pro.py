@@ -7,7 +7,10 @@ from _Framework.ControlSurface import ControlSurface
 from _Framework.ButtonElement import ButtonElement
 from _Framework.InputControlElement import MIDI_CC_TYPE
 from _Framework.TransportComponent import TransportComponent
+from ableton.v2.base import Slot, SlotGroup
 import logging
+
+from .SysExMessenger import SysExMessenger
 
 logger = logging.getLogger(__name__)
 class MC8_Pro(ControlSurface):
@@ -18,6 +21,10 @@ class MC8_Pro(ControlSurface):
             self._build()
 
     def _build(self):
+
+        BUTTON_CC_NUMBERS = [58, 59, 60, 61] # Select between the first 4 chains in the first rack of the current track
+        MIDI_CHANNEL = 0 # Channel 1 in Ableton is index 0 in Python
+
         transport = TransportComponent()
 
         play_button = DynamicFeedbackButton(True, MIDI_CC_TYPE, 0, 55, 4)
@@ -28,6 +35,168 @@ class MC8_Pro(ControlSurface):
         transport.set_stop_button(stop_button)
         transport.set_record_button(record_button)
 
+        self.buttons = []
+        self._macro_listener_target = None
+
+        self._chain_name_slots = SlotGroup(listener=self._on_chain_name_changed, event_name="name")
+
+        self._rack_chains_slot = Slot(
+            listener=self._on_rack_structure_changed,
+            event_name="chains"
+        )
+
+        self._selected_track_slot = Slot(
+        subject=self.song().view,       # Must observe the view object!
+        listener=self._on_track_changed, # Your track changer function
+        event_name="selected_track"     # Looks for 'selected_track_has_listener'
+        )
+
+        self._messenger = SysExMessenger(self._send_midi)
+
+        for index, cc in enumerate(BUTTON_CC_NUMBERS):
+            btn = DynamicFeedbackButton(True, MIDI_CC_TYPE, MIDI_CHANNEL, cc,index)
+            btn.add_value_listener(self._on_button_pressed, identify_sender=True)
+            self.buttons.append(btn)
+
+        self._on_track_changed()
+
+    def _get_first_rack_device(self,track):
+        """Helper to find the first valid rack device on the track"""
+        for device in track.devices:
+            if device.can_have_chains:
+                return device
+        return None
+
+    def _on_track_changed(self):
+
+        # logger.info('Track Changed')
+        """Triggered automatically when switching tracks"""
+        self._cleanup_listeners()
+        
+        track = self.song().view.selected_track
+        device = self._get_first_rack_device(track)
+        
+        if device is not None:
+            # 1. Listen to macro value changes for LEDs
+            if len(device.parameters) > 1:
+                self._macro_listener_target = device.parameters[1]
+                self._macro_listener_target.add_value_listener(self._update_led_feedback)
+            
+            # 2. Listen to structural rack changes (Add, Delete, Move chains)
+            self._rack_chains_slot.subject = device
+            
+            # 3. Setup individual text change listeners for current chains
+            self._setup_chain_name_listeners(device.chains)
+        else:
+            self._rack_chains_slot.subject = None
+
+        self._on_rack_structure_changed()
+
+    def _setup_chain_name_listeners(self, chains):
+        """Attaches rename listeners to up to the first 4 chains safely using SlotGroup"""
+        # Slice the first 4 chains
+        target_chains = chains[:4]
+        
+        # replace_subjects automatically removes old listeners, ignores deleted/null objects, 
+        # and safely binds the 'name' listener to the new 1-4 chains.
+        self._chain_name_slots.replace_subjects(target_chains)
+
+    def _on_rack_structure_changed(self, *args):
+
+        # logger.error('Rack Structure Changed')
+        """Triggered when chains are added, deleted, or moved inside the rack"""
+        device = self._rack_chains_slot.subject
+
+        if device is not None:
+            # Pass the new chain list. SlotGroup safely cleans up the old, dead chains.
+            self._setup_chain_name_listeners(device.chains)
+        else:
+            # If the rack itself was deleted, completely clear all tracked chain slots safely
+            self._chain_name_slots.replace_subjects([])
+
+        # Force structural recalculation updates down to the hardware
+        self._update_all_button_names()
+        self._update_led_feedback()
+
+    def _on_chain_name_changed(self, chain):
+        """Triggered when a specific visible chain is explicitly renamed"""
+        self._update_all_button_names()
+
+    def _update_all_button_names(self):
+        """Updates text fields or blanks them if chains were deleted"""
+        device = self._rack_chains_slot.subject
+        chains = device.chains if device is not None else []
+
+        for index in range(4):
+            if index < len(chains):
+                self._messenger.send_name_sysex(index, chains[index].name)
+            else:
+                self._messenger.send_name_sysex(index, "[EMPTY]")
+
+    def _on_button_pressed(self, value, sender):
+        if value == 0:
+            return
+
+        device = self._rack_chains_slot.subject
+        if device is None or len(device.parameters) <= 1:
+            return
+
+        macro_1 = device.parameters[1]
+        total_chains = len(device.chains)
+        if total_chains == 0:
+            return
+
+        btn_index = self.buttons.index(sender)
+        if btn_index >= total_chains:
+            return
+
+        step_size = 128.0 / total_chains
+        target_value = int((btn_index * step_size) + (step_size / 2))
+        macro_1.value = target_value
+
+    def _update_led_feedback(self):
+        device = self._rack_chains_slot.subject
+        # logger.info(f"Device name is: {device.name if device else 'NO DEVICE'}")
+        if device is None or len(device.parameters) <= 1:
+            for btn in self.buttons:
+                btn.send_value(0)
+            return
+
+        macro_1 = device.parameters[1]
+        total_chains = len(device.chains)
+
+        if total_chains == 0:
+            for btn in self.buttons:
+                btn.send_value(0)
+            return
+
+        step_size = 128.0 / total_chains
+        active_index = int(macro_1.value / step_size)
+        if active_index >= total_chains:
+            active_index = total_chains - 1
+
+        for index, btn in enumerate(self.buttons):
+            if index == active_index and index < total_chains:
+                btn.send_value(127) 
+            else:
+                btn.send_value(0)   
+
+    def handle_sysex(self, midi_bytes):
+        self._messenger.parse_incoming_sysex(midi_bytes)
+
+    def _cleanup_listeners(self):
+        """Helper to break connections cleanly and avoid leaking pointers"""
+        if self._macro_listener_target is not None:
+            if self._macro_listener_target.value_has_listener(self._update_led_feedback):
+                self._macro_listener_target.remove_value_listener(self._update_led_feedback)
+            self._macro_listener_target = None
+
+    def disconnect(self):
+        self._cleanup_listeners()
+        self._chain_name_slots.disconnect()
+        self._rack_chains_slot.disconnect()
+        super(MC8_Pro, self).disconnect()
+
     def send_morningstar_midi(self, status, target_cc, feedback_val):
         """
         A completely independent method dedicated ONLY to Morningstar feedback.
@@ -35,7 +204,7 @@ class MC8_Pro(ControlSurface):
         and respects Ableton's optimization/accumulation queue.
         """
         midi_tuple = (status, target_cc, feedback_val)
-        logger.info("Morningstar Custom Routing: Status={}, CC={}, Val={}".format(status, target_cc, feedback_val))
+        # logger.info("Morningstar Custom Routing: Status={}, CC={}, Val={}".format(status, target_cc, feedback_val))
 
         # Check if Ableton is accumulating MIDI optimization buffers
         if self._accumulate_midi_messages:
@@ -50,14 +219,10 @@ class MC8_Pro(ControlSurface):
             self._do_send_midi(midi_tuple)
         return True
 
-    def disconnect(self):
-        super(MC8_Pro, self).disconnect()
-
 class DynamicFeedbackButton(ButtonElement):
     def __init__(self, is_momentary, msg_type, channel, identifier, feedback_val, *a, **k):
         super(DynamicFeedbackButton, self).__init__(is_momentary, msg_type, channel, identifier, *a, **k)
         self.feedback_val = feedback_val
-
 
     def _do_send_value(self, *a, **k):
         """
